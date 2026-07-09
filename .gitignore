@@ -1,1 +1,11 @@
+# Source records-response PDFs — may contain PII, never commit (CLAUDE.md rule 2)
 *.pdf
+
+# Extracted data derived from those PDFs — same PII caution, keep it out of git
+*.csv
+output/
+
+# Python
+__pycache__/
+*.pyc
+.venv/

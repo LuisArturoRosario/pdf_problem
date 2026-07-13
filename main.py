@@ -77,7 +77,9 @@ if args.file:
 
     # OUTPUT: write one CSV. Use the PDF's stem so the extension is .csv, and
     # build the path with pathlib so it works on Windows too.
-    output_path = Path(args.output) / f"{input_path.stem}.csv"
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)  # create the output folder if missing
+    output_path = output_dir / f"{input_path.stem}.csv"
     df.to_csv(output_path, index=False)
     print(
         f"Extracted {len(df)} rows across "
@@ -97,7 +99,9 @@ elif args.files:
         df = extract_tables(file)
 
         # OUTPUT
-        output_path = Path(args.output) / f"{file.stem}.csv"
+        output_dir = Path(args.output)
+        output_dir.mkdir(parents=True, exist_ok=True)  # create the output folder if missing
+        output_path = output_dir / f"{file.stem}.csv"
         df.to_csv(output_path, index=False)
         print(f"Saved {len(df)} rows -> {output_path}")
 

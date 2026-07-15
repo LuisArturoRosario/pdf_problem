@@ -334,6 +334,9 @@ def extract_tables(pdf_path):
     match the header.
     """
     doc = pdf.open(str(pdf_path))
+    if doc.page_count < args.start_page:
+        raise ValueError(f"{pdf_path}: --start_page is beyond the number of pages in the pdf.")
+
     header = None
     col_lefts = None        # borderless column left-edges, once detected
     top_aligned = False     # borderless record alignment, once detected
@@ -342,6 +345,8 @@ def extract_tables(pdf_path):
     try:
         for page_index, page in enumerate(doc):
             page_number = page_index + 1  # provenance: pages are 1-based to humans
+            if page_number < args.start_page:
+                continue
             # Once a doc is known borderless, skip the (costly) ruled-table probe.
             tables = [] if mode == "borderless" else page.find_tables().tables
             if tables:
@@ -394,11 +399,14 @@ parser = argparse.ArgumentParser(description="Process PDF files")
 parser.add_argument("--file", help="Path to the PDF file")
 parser.add_argument("--files", nargs="+", help="Path to directory of PDF files")
 parser.add_argument("--output", help="Path to the output CSV file") # Default to current dir of running processes
-
+parser.add_argument("--start_page", type=int, default=1, help="Start page for processing")
 args = parser.parse_args()
 
 if args.output is None:
     args.output = "."
+
+if args.start_page < 1:
+    raise ValueError("--start_page must be a positive integer")
 
 if args.file:
     print(f"Processing {args.file}")

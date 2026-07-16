@@ -51,6 +51,24 @@ true of the Tallahassee sample). The header is taken from the first table found;
 any later row that *exactly equals* that header is treated as a repeated
 continuation header and skipped, not emitted as data.
 
+## Ruled vs. borderless tables (extraction mechanism, not format)
+
+The **format above is identical regardless of how a table is drawn.** Two
+extraction paths feed it, chosen automatically per page:
+
+- **Ruled tables** — cells boxed by drawn lines/rectangles (the Tallahassee
+  sample) — via PyMuPDF `find_tables()`.
+- **Borderless tables** — clear rows/columns but no ruled lines (the Walla Walla
+  sample) — by inferring columns from word x-positions when a page has text but
+  `find_tables()` finds nothing.
+
+Both paths produce the same container: one row per record, `source_page` first,
+string/null cells, blanks preserved, nothing fabricated. Multi-line (wrapped)
+cells such as intersection addresses are reassembled into a single cell. The
+borderless approach, its routing signal, tuning constants, fail-loud gates, and
+limitations are recorded in
+[`docs/decisions/0001-borderless-table-extraction.md`](decisions/0001-borderless-table-extraction.md).
+
 ## Fail-loud behavior
 
 The extractor raises (rather than guessing or silently producing partial output)

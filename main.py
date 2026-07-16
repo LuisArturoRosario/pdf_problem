@@ -20,6 +20,49 @@ _COL_MERGE_TOL = 20.0       # a header label farther than this from every data c
 _MIN_BORDERLESS_COLS = 2    # fewer columns than this is not a table
 _MIN_BORDERLESS_ROWS = 3    # need at least this many record rows to trust a detection
 
+# A redaction box is painted (near-)black. Every RGB channel at or below this
+# (0.0 = pure black, 1.0 = white) counts as an opaque black box.
+_REDACTION_MAX_CHANNEL = 0.15
+
+
+def _redact_black_boxes(page):
+    """Blank out text hidden under opaque black boxes (reversible redactions).
+
+    Some records responses "redact" a value by drawing a filled black rectangle
+    *over* text that is still present in the PDF's text layer. A naive extractor
+    reads the value straight through the box -- the redaction is only visual.
+    Here we find those black boxes and delete the text underneath them, so the
+    cell extracts as blank (None -> null in the CSV) instead of leaking the
+    hidden value. We remove only the covered text -- never ruled lines or images
+    -- so table detection downstream is unaffected.
+
+    Returns the number of black boxes found (for logging/provenance).
+
+    Known limit: a dark rectangle used purely as a design element (e.g. a header
+    bar with light text on top) would also be treated as a redaction. These
+    plain records tables don't use them; revisit if a real sample does.
+    """
+    boxes = []
+    for drawing in page.get_drawings():
+        fill = drawing.get("fill")
+        # Keep only *filled*, (near-)black shapes that enclose real area.
+        if fill is None or max(fill) > _REDACTION_MAX_CHANNEL:
+            continue
+        rect = drawing["rect"]
+        if rect.is_empty or rect.width <= 0 or rect.height <= 0:
+            continue
+        boxes.append(rect)
+
+    for rect in boxes:
+        page.add_redact_annot(rect)
+    if boxes:
+        # Remove only text under the boxes; leave line art and images intact.
+        page.apply_redactions(
+            images=pdf.PDF_REDACT_IMAGE_NONE,
+            graphics=pdf.PDF_REDACT_LINE_ART_NONE,
+        )
+    return len(boxes)
+
 
 def _clean_cell(value):
     """Normalize one extracted cell.
@@ -347,6 +390,14 @@ def extract_tables(pdf_path):
             page_number = page_index + 1  # provenance: pages are 1-based to humans
             if page_number < args.start_page:
                 continue
+            # Blank text hidden under black boxes first, so both paths below read
+            # a redacted cell as empty rather than leaking the value beneath it.
+            boxes = _redact_black_boxes(page)
+            if boxes:
+                print(
+                    f"  [redaction] page {page_number}: blanked text under "
+                    f"{boxes} black box(es)"
+                )
             # Once a doc is known borderless, skip the (costly) ruled-table probe.
             tables = [] if mode == "borderless" else page.find_tables().tables
             if tables:

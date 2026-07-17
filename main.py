@@ -23,6 +23,10 @@ _MIN_BORDERLESS_ROWS = 3    # need at least this many record rows to trust a det
 # A redaction box is painted (near-)black. Every RGB channel at or below this
 # (0.0 = pure black, 1.0 = white) counts as an opaque black box.
 _REDACTION_MAX_CHANNEL = 0.15
+# A redaction box covers text, so it has real width AND height. Ruled table
+# lines are also filled black but are hairline-thin in one dimension; requiring
+# both sides to exceed this (PDF points) keeps boxes and excludes grid lines.
+_REDACTION_MIN_BOX_PT = 3.0
 
 # Quarter-turns (90 deg clockwise) that straighten each dominant text-writing
 # direction. PyMuPDF reports a line's direction as a unit vector: (1, 0) is
@@ -44,6 +48,9 @@ def _redact_black_boxes(page):
 
     Returns the number of black boxes found (for logging/provenance).
 
+    Ruled table lines are also filled black but hairline-thin, so we keep only
+    box-shaped fills (see ``_REDACTION_MIN_BOX_PT``) and leave grid lines alone.
+
     Known limit: a dark rectangle used purely as a design element (e.g. a header
     bar with light text on top) would also be treated as a redaction. These
     plain records tables don't use them; revisit if a real sample does.
@@ -55,7 +62,9 @@ def _redact_black_boxes(page):
         if fill is None or max(fill) > _REDACTION_MAX_CHANNEL:
             continue
         rect = drawing["rect"]
-        if rect.is_empty or rect.width <= 0 or rect.height <= 0:
+        # Require a box shape: skip hairline-thin shapes, which are ruled table
+        # lines (also filled black) rather than redactions covering text.
+        if rect.width < _REDACTION_MIN_BOX_PT or rect.height < _REDACTION_MIN_BOX_PT:
             continue
         boxes.append(rect)
 

@@ -24,6 +24,12 @@ _MIN_BORDERLESS_ROWS = 3    # need at least this many record rows to trust a det
 # (0.0 = pure black, 1.0 = white) counts as an opaque black box.
 _REDACTION_MAX_CHANNEL = 0.15
 
+# Quarter-turns (90 deg clockwise) that straighten each dominant text-writing
+# direction. PyMuPDF reports a line's direction as a unit vector: (1, 0) is
+# ordinary left-to-right text; the others are pages drawn sideways or upside
+# down. Used to re-orient native-text pages before column detection.
+_DIR_TO_TURNS = {(1, 0): 0, (0, -1): 1, (-1, 0): 2, (0, 1): 3}
+
 
 def _redact_black_boxes(page):
     """Blank out text hidden under opaque black boxes (reversible redactions).
@@ -75,6 +81,55 @@ def _clean_cell(value):
         return None
     text = " ".join(value.split())
     return text if text != "" else None
+
+
+def _upright_turns(page):
+    """How many 90-deg clockwise turns make this page's text read upright.
+
+    A few native-text PDFs draw an entire table sideways -- e.g. a landscape
+    report placed on a portrait page (San Rafael is the scanned look-alike of
+    this). PyMuPDF then returns word coordinates in that sideways space, so the
+    column detection -- which assumes text reads left-to-right -- mis-parses the
+    page. We read the dominant writing direction across the page's text lines
+    and return the turns needed to straighten it. Returns 0 for ordinary upright
+    pages, so they are left completely untouched.
+    """
+    seen = Counter()
+    for block in page.get_text("dict")["blocks"]:
+        for line in block.get("lines", []):
+            direction = (round(line["dir"][0]), round(line["dir"][1]))
+            if direction in _DIR_TO_TURNS:
+                seen[direction] += len(line.get("spans", []))
+    if not seen:
+        return 0
+    dominant = seen.most_common(1)[0][0]
+    return _DIR_TO_TURNS[dominant]
+
+
+def _rotate_words_upright(words, page_rect, turns):
+    """Rotate word boxes by ``turns`` 90-deg clockwise turns into upright space.
+
+    Returns new ``(x0, y0, x1, y1, text)`` tuples so the existing row/column
+    detection runs unchanged; ``turns == 0`` returns the words as-is. Only the
+    geometry is rotated -- each word's text is left exactly as extracted.
+    """
+    if turns == 0:
+        return words
+    w, h = page_rect.width, page_rect.height
+
+    def rotate(x, y):
+        if turns == 1:          # 90 clockwise;      page becomes h x w
+            return h - y, x
+        if turns == 2:          # 180;               page stays  w x h
+            return w - x, h - y
+        return y, w - x         # 270 (turns == 3);  page becomes h x w
+
+    rotated = []
+    for word in words:
+        ax, ay = rotate(word[0], word[1])
+        bx, by = rotate(word[2], word[3])
+        rotated.append((min(ax, bx), min(ay, by), max(ax, bx), max(ay, by), word[4]))
+    return rotated
 
 
 def _cluster_rows(words, tol=_ROW_Y_TOLERANCE):
@@ -430,6 +485,16 @@ def extract_tables(pdf_path):
                 words = page.get_text("words")
                 if not words:
                     continue  # genuinely empty page
+                # Straighten native-text pages whose table is drawn sideways, so
+                # the column logic (which assumes left-to-right text) can read
+                # it. Upright pages return turns == 0 and are left unchanged.
+                turns = _upright_turns(page)
+                if turns:
+                    words = _rotate_words_upright(words, page.rect, turns)
+                    print(
+                        f"  [orientation] page {page_number}: text drawn "
+                        "sideways; rotated upright before extraction"
+                    )
                 # BORDERLESS PATH: infer columns from word x-positions.
                 col_lefts, header, top_aligned, page_records = _extract_borderless_page(
                     pdf_path, words, page_number, col_lefts, header, top_aligned

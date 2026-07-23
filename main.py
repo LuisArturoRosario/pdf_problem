@@ -1,7 +1,11 @@
 import pymupdf as pdf
 import pandas as pd
 import argparse
+import base64
 import bisect
+import json
+import os
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -33,6 +37,55 @@ _REDACTION_MIN_BOX_PT = 3.0
 # ordinary left-to-right text; the others are pages drawn sideways or upside
 # down. Used to re-orient native-text pages before column detection.
 _DIR_TO_TURNS = {(1, 0): 0, (0, -1): 1, (-1, 0): 2, (0, 1): 3}
+
+
+# --- AI extraction fallback (Claude vision) ----------------------------------
+# Runs ONLY when the deterministic engine finds no table AND the user opts in
+# (--ai-fallback, or an interactive prompt). It sends each page as an image to
+# the Claude API and asks for structured rows. This path is probabilistic, so
+# its output is labelled ai_vision and must be spot-checked. Rationale, guard-
+# rails, and the stakeholder data-sharing approval are in
+# docs/decisions/0003-ai-extraction-fallback.md.
+_AI_MODEL = "claude-opus-4-8"    # single knob; swap to "claude-sonnet-5" to trade cost for a small accuracy margin
+_AI_RENDER_DPI = 200             # page-image resolution sent to the model
+_AI_MAX_TOKENS = 16000           # per-page output ceiling (one page of rows is small)
+_AI_METHOD_LABEL = "ai_vision"   # value written to the extraction_method provenance column
+
+# The model must transcribe, never invent. Blacked-out/blank/illegible cells
+# become null so redactions stay null (Rules #4/#5) and locations are never
+# guessed (Rule #7). Cached across pages (it never changes) to cut cost.
+_AI_SYSTEM = (
+    "You transcribe a single page of a public-records table into structured rows.\n"
+    "Rules you must follow exactly:\n"
+    "- Transcribe every value EXACTLY as printed. Never correct spelling, expand "
+    "abbreviations, reformat dates/numbers, or infer a value from context.\n"
+    "- If a cell is blacked-out/redacted, blank, or illegible, output null. NEVER "
+    "guess a value that is not clearly readable.\n"
+    "- Return every data row on the page. Do NOT emit page titles, column-header "
+    "rows, footers, or subtotal/total lines as data rows.\n"
+    "- Conform to the JSON schema: a 'columns' array (the table's column headers, "
+    "left to right) and a 'rows' array in which each row is an array of cells "
+    "aligned to 'columns' in the same order. Each cell is a string or null."
+)
+
+# Structured-output schema: dynamic columns (we don't know them ahead of time),
+# rows as arrays aligned to those columns, cells nullable. Enforced by the API so
+# there is no free-text parsing and the model cannot drift off-format.
+_AI_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "columns": {"type": "array", "items": {"type": "string"}},
+        "rows": {
+            "type": "array",
+            "items": {
+                "type": "array",
+                "items": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            },
+        },
+    },
+    "required": ["columns", "rows"],
+    "additionalProperties": False,
+}
 
 
 def _redact_black_boxes(page):
@@ -520,11 +573,214 @@ def extract_tables(pdf_path):
     return pd.DataFrame(records, columns=["source_page"] + header)
 
 
+def _ai_client():
+    """Build a Claude client, failing loud if the SDK or API key is missing.
+
+    We require ANTHROPIC_API_KEY explicitly rather than relying on other credential
+    sources, so a misconfigured run says exactly what to fix instead of erroring
+    deep inside the first request.
+    """
+    try:
+        import anthropic
+    except ModuleNotFoundError as exc:  # pragma: no cover - environment guard
+        raise ValueError(
+            "AI fallback needs the 'anthropic' package. Install it with: uv add anthropic"
+        ) from exc
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise ValueError(
+            "AI fallback needs the ANTHROPIC_API_KEY environment variable to be set."
+        )
+    return anthropic.Anthropic()
+
+
+def _ai_page_image_b64(page):
+    """Blank redactions, then render the page to a base64 PNG for the model.
+
+    ``_redact_black_boxes`` runs first so text hidden under a black box is deleted
+    from the text layer; the black box itself stays drawn, so the model sees an
+    opaque box (and emits null) rather than the value beneath it.
+    """
+    _redact_black_boxes(page)
+    pixmap = page.get_pixmap(dpi=_AI_RENDER_DPI)
+    return base64.standard_b64encode(pixmap.tobytes("png")).decode("ascii")
+
+
+def _ai_header(columns):
+    """Normalize the model's column names; fill any blank with a positional name."""
+    names = [_clean_cell(c) for c in columns]
+    return [n if n else f"column_{i + 1}" for i, n in enumerate(names)]
+
+
+def _ai_align_row(row, header, page_number):
+    """Align one model row to the established columns without guessing.
+
+    Short rows are padded with None (a blank, never an invented value); over-long
+    rows keep the leading cells. Both cases are logged, never silent, so a
+    spot-checker can see where the model and the schema disagreed.
+    """
+    cells = [_clean_cell(c) for c in row]
+    if len(cells) < len(header):
+        print(
+            f"  [ai-fallback] page {page_number}: row had "
+            f"{len(cells)} cells for {len(header)} columns; padded the rest with null"
+        )
+        cells = cells + [None] * (len(header) - len(cells))
+    elif len(cells) > len(header):
+        print(
+            f"  [ai-fallback] page {page_number}: row had "
+            f"{len(cells)} cells for {len(header)} columns; kept the first {len(header)}"
+        )
+        cells = cells[: len(header)]
+    return cells
+
+
+def _ai_extract_page(client, image_b64, page_number, columns):
+    """Ask the model for structured rows from one page image.
+
+    On the first page ``columns`` is None and the model infers the header; on
+    later pages the established columns are passed back so rows stay aligned to one
+    schema. Returns ``(columns, rows)`` exactly as the model gave them; alignment
+    and cleaning happen in the caller.
+    """
+    if columns is None:
+        instruction = (
+            "Identify the table's columns from its header row and return them in "
+            "'columns'. Then return every data row on the page, each aligned to "
+            "those columns."
+        )
+    else:
+        instruction = (
+            "Use EXACTLY these columns, in this order, and return them unchanged in "
+            "'columns':\n" + " | ".join(columns) + "\n"
+            "Return every data row as an array aligned to them. The column-header "
+            "row may repeat at the top of this page; do not emit it as a data row."
+        )
+    response = client.messages.create(
+        model=_AI_MODEL,
+        max_tokens=_AI_MAX_TOKENS,
+        system=[{"type": "text", "text": _AI_SYSTEM, "cache_control": {"type": "ephemeral"}}],
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
+                },
+                {"type": "text", "text": instruction},
+            ],
+        }],
+        output_config={"format": {"type": "json_schema", "schema": _AI_SCHEMA}},
+    )
+    if response.stop_reason == "refusal":
+        raise ValueError(f"page {page_number}: the model declined to process this page.")
+    text = "".join(b.text for b in response.content if b.type == "text")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"page {page_number}: could not parse the model's structured output "
+            f"(stop_reason={response.stop_reason}); the page may be too dense for one request."
+        ) from exc
+    return data.get("columns") or [], data.get("rows") or []
+
+
+def extract_with_ai(pdf_path, start_page=1):
+    """AI FALLBACK: read each page image into rows via the Claude API.
+
+    Used only when the deterministic engine fails and the user opts in. Provenance
+    is preserved (``source_page`` is assigned here, in code, never by the model)
+    and every row is stamped ``extraction_method = ai_vision`` so it is visibly
+    distinct from deterministic output. Columns are detected once and reused, so
+    the whole document lands in one consistent schema. Fails loud if no columns
+    can be read at all.
+    """
+    client = _ai_client()
+    doc = pdf.open(str(pdf_path))
+    if doc.page_count < start_page:
+        doc.close()
+        raise ValueError(f"{pdf_path}: --start_page is beyond the number of pages in the pdf.")
+
+    header = None
+    records = []
+    try:
+        for page_index, page in enumerate(doc):
+            page_number = page_index + 1  # provenance: pages are 1-based to humans
+            if page_number < start_page:
+                continue
+            image_b64 = _ai_page_image_b64(page)
+            columns, rows = _ai_extract_page(client, image_b64, page_number, header)
+            if header is None:
+                if not columns:
+                    continue  # no table detected on this page yet; keep looking
+                header = _ai_header(columns)
+                print(
+                    f"  [ai-fallback] page {page_number}: inferred "
+                    f"{len(header)} columns from the page image"
+                )
+            for row in rows:
+                cells = _ai_align_row(row, header, page_number)
+                record = {"source_page": page_number}
+                record.update(zip(header, cells))
+                record["extraction_method"] = _AI_METHOD_LABEL
+                records.append(record)
+    finally:
+        doc.close()
+
+    if header is None:
+        raise ValueError(f"{pdf_path}: the AI extractor found no columns in the PDF.")
+
+    return pd.DataFrame(
+        records, columns=["source_page"] + header + ["extraction_method"]
+    )
+
+
+def _should_use_ai_fallback(reason):
+    """Whether to run the AI fallback: opt-in only, never silent.
+
+    The --ai-fallback flag forces it (for scripted/pipeline runs). Otherwise, only
+    prompt when attached to a terminal; a non-interactive run without the flag
+    keeps the original fail-loud behaviour rather than calling a paid API unasked.
+    """
+    if args.ai_fallback:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    reply = input(
+        f"Normal extraction failed: {reason}\n"
+        "Try the AI extractor (Claude vision, sends page images to the Claude API)? [y/N] "
+    )
+    return reply.strip().lower() in ("y", "yes")
+
+
+def extract_with_fallback(pdf_path):
+    """Run the deterministic engine; on failure, offer the AI fallback."""
+    try:
+        return extract_tables(pdf_path)
+    except ValueError as exc:
+        if not _should_use_ai_fallback(exc):
+            raise
+        print(
+            f"  [ai-fallback] using Claude vision ({_AI_MODEL}); output is AI-derived "
+            "- spot-check it, addresses especially"
+        )
+        return extract_with_ai(pdf_path, args.start_page)
+
+
 parser = argparse.ArgumentParser(description="Process PDF files")
 parser.add_argument("--file", help="Path to the PDF file")
 parser.add_argument("--files", nargs="+", help="Path to directory of PDF files")
 parser.add_argument("--output", help="Path to the output CSV file") # Default to current dir of running processes
 parser.add_argument("--start_page", type=int, default=1, help="Start page for processing")
+parser.add_argument(
+    "--ai-fallback",
+    action="store_true",
+    help=(
+        "If normal extraction finds no table, use the Claude vision AI extractor "
+        "(sends page images to the Claude API; output is AI-derived, spot-check it). "
+        "Without this flag, an interactive run prompts y/N and a non-interactive run "
+        "fails loud."
+    ),
+)
 args = parser.parse_args()
 
 if args.output is None:
@@ -538,8 +794,10 @@ if args.file:
     # Process single PDF file
     input_path = Path(args.file)
 
-    # EXTRACT: PDF -> intermediary DataFrame (one row per record, with provenance)
-    df = extract_tables(input_path)
+    # EXTRACT: PDF -> intermediary DataFrame (one row per record, with provenance).
+    # Falls back to the Claude vision extractor if the deterministic engine finds
+    # no table and the user opts in (--ai-fallback or the interactive prompt).
+    df = extract_with_fallback(input_path)
 
     # OUTPUT: write one CSV. Use the PDF's stem so the extension is .csv, and
     # build the path with pathlib so it works on Windows too.
@@ -562,7 +820,7 @@ elif args.files:
         print(f"Processing {file.name}")
 
         # EXTRACT: same stage as the single-file branch, applied per file.
-        df = extract_tables(file)
+        df = extract_with_fallback(file)
 
         # OUTPUT
         output_dir = Path(args.output)
